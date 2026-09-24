@@ -63,7 +63,47 @@ WanGP is a one-stop super app for the best open source generative models across 
 
 
 ## 🔥 Latest Updates : 
-## 13th of September 2026: WanGP v13.00 — It's Your Lucky Day!
+## 24th of September 2026: WanGP v13.1314 — It's Your Lucky Day^$\pi$!
+
+- **Qwen Image 2.1**: A new Qwen Image model with out-of-the-box editing capabilities and strong text rendering. 
+
+WanGP supports *VRAM Optimization*, *Pose/Depth/Edge Transfer*, *Inpainting*, *LanPaint*, *Outpainting*, *KV Cache Acceleration*, and *Enhanced Prompts* from day one.
+
+No distilled version is available yet.
+
+- **Full JIT Checkpoint Loading**: WanGP now downloads preprocessing and postprocessing checkpoints only when needed, instead of downloading them all on first use. This saves disk space if you use WanGP for a specific task, such as audio generation, or want to build a portable version of WanGP.
+
+- **Comfy Kitchen Kernels Support**: These kernels are installed automatically and can accelerate specific models. They have been integrated into H3 and LTX2.x, which are now 10% faster.
+
+- **Minimax H3 INT8 ConvRot VAE**: Twice as fast. Now downloaded automatically and used by default when INT8 is selected in your transformer configuration. 
+
+- **Deepy Prime for the Masses**: Thanks to the new *Bonsai 2 Abliterated PTQ1_0 checkpoint*, *Deepy Prime* and its advanced *Prompt Enhancer* can now run with **10 GB of VRAM, or possibly less**. You will need *GGUF CUDA kernels 1.0.22*. Please see the installation guide.  
+
+- **UI Optimizations**: The UI should be even faster, especially the Image/Video Gallery.
+
+- **Yue2 Instrumental Model Only**: you can now generate instrumentals track only, please check new option in main dropdown box and also prompt instructions or new prompt enhancer templates. 
+
+- **Yue2 Hum to Song**: Turn a clear hummed melody, your lyrics and a music style into a new stereo song.
+
+- **YuE2 support AR LoRAs**: YuE2 first phase, is an Auto Regressive phase (score writing phase) and it can now accept LoRAs. LoRAs for second Diffusion phase was already added previously.
+
+- **DFlash2 & DSpark Acceleration for Deepy & Prompt Enhancer***: for an extra VRAM cost you will be able to generate up tp 200 tokens / s
+
+- **Various UI Improvements**: add directly the current frame of Video Gallery to the Image Gallery, Extract settings of a Video/Audio/Image in Workspace Gallery 
+
+- **Ming Image 0.1 Design**: a new image generation and editing model for detailed infographics, posters, and carefully arranged layouts. It accepts standard text prompts and a structured JSON format for more precise control over composition. WanGP's visual **Prompt Helper** lets you arrange layers and edit their positions, colors, and descriptions. You can also choose a classic or JSON prompt enhancer to turn a short brief into a detailed prompt with explicit titles, labels, and explanations.
+
+- **Ming Image 0.1 Design-Layer**: turn a finished poster, infographic, or other design into separate transparent image layers. Provide one reference image and a text prompt describing the layers from front to back. WanGP adds every RGBA layer to the image gallery and saves a ZIP of the complete layer set. Design and Design-Layer share their language encoder and vision tower checkpoints to reduce downloads and disk use.
+
+- **Qwen Image 2.1 Viggle Turbo LoRA Accelerators**: generate images faster with **Viggle Turbo v0.1 (4 steps)** or **v0.2 (5 steps)**. Select an acceleration profile to apply the matching LoRA and recommended generation settings.
+
+- **Remove Vocals Audio Postprocessing**: create an instrumental version of an audio track by removing its vocals. Available in **Post Processing**, **Late Post Processing**, and through **Deepy Prime**.
+
+
+*Update v13.1313*: YuE2 instrumental mode, YuE2 Hum to Song, AR LoRA support, and DFlash2 / DSpark acceleration\
+*Update v13.1314*: Ming Image 0.1 Design and Design-Layer, Qwen Image 2.1 Viggle Turbo LoRA accelerators, and Remove Vocals audio postprocessing
+
+## 16th of September 2026: WanGP v13.10 — It's Your Lucky Day!
 
 **WanGP Major Release**
 
@@ -77,6 +117,7 @@ WanGP is a one-stop super app for the best open source generative models across 
 
 - **Deepy Web App**: take Deepy with you in a phone-friendly interface. Upload a photo or recording, describe what you want, and follow the conversation and results from your phone or desktop. Open **Web app →** in Deepy's settings to find it, and add it to your phone's home screen for quick access. See the [Deepy guide](docs/DEEPY.md). You can use this way both *Deepy Zero* & *Deepy Prime*, although you will get best results with *Deepy Prime*.
 
+- **Prompt Enhancer Upgrades**: when using a Qwen3.5/3.8 powered Prompt Enhancer, now all attached images (Start Image/End Image/Control Image/Ref Images) may be used to produce the enhanced prompt. The prompt enhancer is also given the duration of the video / sliding window you want to generate (this works also when prompt commands like [\duration=3s] are used). Even better multiple sliding windows prompts can be enhanced at the same time based on the actual start/end frames they will see.
 
 **New Models**
 
@@ -84,6 +125,9 @@ WanGP is a one-stop super app for the best open source generative models across 
 
 - **AuK Speech**: generate speech from written instructions, or use a source recording for voice cloning, spoken-word edits, speech cleanup, and speaker separation. Choose **Flash** for a fast four-step result or **Base** for more control. Start with a short clip and describe both what to change and what to preserve.
 
+- **LTX2.5 updates**: added LTX 2.5 MSR (reference to videos), LTX 2.5 Ingredients is now used when Ref. Images are provided, updated Media Flow processes with LTX 2.5 unblur and uncompress LoRAs
+
+*update 13.10*: Prompt Enhancer Upgrades, LTX2.5 updates
 
 ## 6th of September 2026: WanGP v12.72 — Power Up, Polish, Pause
 - **H3 VDN**: at least 20% Faster and even more on larger / longer videos, requires a bit more VRAM and Triton must be installed
@@ -638,7 +682,8 @@ For detailed installation instructions for different GPU generations:
 - **[Prompts Guide](docs/PROMPTS.md)** - How WanGP interprets prompts, images as prompts, enhancers, and macros
 
 ### Advanced Features
-- **[Deepy Assistant](docs/DEEPY.md)** - Launch Deepy in Gradio, CLI or standalone Web mode; configure tools, media references, saved sessions, phone access, HTTPS and authentication
+- **[Deepy Assistant](docs/DEEPY.md)** - Launch Deepy in Gradio, CLI or standalone Web mode; configure tools, media references, saved sessions and phone access
+- **[Authentication, HTTPS, and Reverse Proxies](docs/AUTHENTICATION.md)** - Protect web access, configure proxy hosting with `--public-url`, and set up MCP OAuth
 - **[Remote LLMs](docs/REMOTE_LLMS.md)** - Configure Codex, Claude Code, and OpenCode providers for Deepy and Prompt Enhancer
 - **[Loras Guide](docs/LORAS.md)** - Using and managing Loras for customization
 - **[Finetunes](docs/FINETUNES.md)** - Add manually new models to WanGP
