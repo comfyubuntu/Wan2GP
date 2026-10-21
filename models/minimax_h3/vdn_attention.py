@@ -84,15 +84,6 @@ def _activate(x, normalize):
     return F.normalize(x, dim=-1, eps=1e-6).to(x.dtype) if normalize else x
 
 
-def _weight_fp32(weight):
-    # Quantized weight tensors (e.g. the int8_convrot module variant) refuse a plain
-    # dtype cast ("The dtype of a weights Tensor cannot be changed"), so dequantize
-    # them first; plain tensors just get cast straight to float32.
-    if hasattr(weight, "dequantize"):
-        weight = weight.dequantize()
-    return weight.float()
-
-
 class OutputGate(nn.Module):
     def __init__(self, hidden, heads, head_dim=None, bottleneck=None, dtype=None, device=None):
         super().__init__()
@@ -116,7 +107,9 @@ class FrameKDAAlpha(nn.Module):
 
     def forward(self, x):
         with torch.autocast(device_type=x.device.type, enabled=False):
-            delta = F.linear(F.linear(x.float(), _weight_fp32(self.down.weight)), _weight_fp32(self.up.weight))
+            # Run the modules so quantization transforms and offload hooks apply.
+            delta = self.down(x.to(self.down.weight.dtype))
+            delta = self.up(delta.to(self.up.weight.dtype)).float()
             delta = delta.view(-1, self.heads, self.head_dim) + self.dt_bias.float().view(1, self.heads, self.head_dim)
             return torch.exp(-torch.exp(self.A_log.float())[None, :, None] * F.softplus(delta))
 
