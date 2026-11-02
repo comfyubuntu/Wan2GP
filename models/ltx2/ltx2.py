@@ -15,7 +15,6 @@ from safetensors.torch import load_file
 from shared.utils import files_locator as fl
 from shared.utils.phase_progress import generation_progress
 from shared.cuda_memory import mmgp_vram_allocator
-from shared.kernels import scaled_fp16
 from shared.utils.hdr import VIDEO_PROMPT_HDR_OUTPUT_FLAG, hdr_linear_to_vae_range, sdr_to_vae_range
 
 from .ltx_core.conditioning import AudioConditionByLatent, AudioConditionByLatentPrefix, AudioConditionByReferenceLatent
@@ -1016,7 +1015,6 @@ class LTX2:
             video_vae = _VAEContainer(video_encoder, video_decoder)
         vae_postprocess = _make_diffusion_vae_postprocess("vae.") if diffusion_vae else _make_vae_postprocess("vae.")
         video_vae = _load_component(video_vae, video_vae_path, postprocess=vae_postprocess, ignore_unused_weights=True)
-        scaled_fp16.install(video_vae.encoder if diffusion_vae else video_vae, self.device)  # Turing: BF16 convolutions on FP16 tensor cores
         video_encoder = video_vae.encoder
         video_decoder = video_vae.decoder
 
@@ -1076,7 +1074,6 @@ class LTX2:
             with init_empty_weights():
                 spatial_upsampler = LatentUpsamplerConfigurator.from_config(upsampler_config)
             spatial_upsampler = _load_component(spatial_upsampler, spatial_upsampler_path, None)
-            scaled_fp16.install(spatial_upsampler, self.device)
 
         self.text_encoder = text_encoder
         self.text_embedding_projection = text_embedding_projection
@@ -1399,6 +1396,7 @@ class LTX2:
         audio_cfg_scale: float | None = None,
         alt_scale: float = 0.0,
         sample_solver: str = "",
+        custom_sigmas=None,
         NAG_scale: float = 1.0,
         NAG_tau: float = 3.5,
         NAG_alpha: float = 0.5,
@@ -1454,7 +1452,7 @@ class LTX2:
             alpha_source = input_frames
             height, width = input_frames.shape[-2:]
             if max(height, width) > 1920 or min(height, width) > 1088:
-                raise ValueError("Alpha Gen supports source videos up to 1920×1088. Resize the source before loading it.")
+                raise ValueError("Alpha Gen supports source videos up to 1920Ã—1088. Resize the source before loading it.")
             frame_num = min(frame_num, input_frames.shape[1])
             input_prompt = ""
             guide_phases = 1
@@ -1868,12 +1866,13 @@ class LTX2:
         ltx2_22B_class = self.model_def.get("ltx2_22B_class", False)
 
         def run_ltx2_pipeline(**pipeline_kwargs):
+            pipeline_kwargs["custom_sigmas"] = custom_sigmas
             pipeline_context = self.pipeline.joyai_echo_context(joyai_context) if joyai_context is not None else nullcontext()
             with pipeline_context:
                 return self.pipeline(**pipeline_kwargs)
 
         if hdr_transform == "acescct":
-            pipeline_output = convert_sdr_to_hdr(self.model, self.video_encoder, self.video_decoder, self.pipeline.pipeline_components, self.device, input_frames, prefix_frames_count if images else 0, images, hdr_scene_context[0], int(frame_num), target_height, target_width, float(fps), int(seed), tiling_config=tiling_config, loras_slists=loras_slists, callback=callback, set_progress_status=set_progress_status, interrupt_check=interrupt_check), None
+            pipeline_output = convert_sdr_to_hdr(self.model, self.video_encoder, self.video_decoder, self.pipeline.pipeline_components, self.device, input_frames, prefix_frames_count if images else 0, images, hdr_scene_context[0], int(frame_num), target_height, target_width, float(fps), int(seed), tiling_config=tiling_config, loras_slists=loras_slists, callback=callback, set_progress_status=set_progress_status, interrupt_check=interrupt_check, custom_sigmas=custom_sigmas), None
         elif isinstance(self.pipeline, TI2VidTwoStagesPipeline):
             pipeline_output = run_ltx2_pipeline(
                 prompt=input_prompt,

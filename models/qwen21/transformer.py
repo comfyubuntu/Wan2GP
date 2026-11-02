@@ -30,7 +30,6 @@ def dispatch_attention_fn(qkv_list, attn_mask=None, recycle_q=False):
     # The highest owning caller clears its Q/K/V names before this handoff.
     return pay_attention(qkv_list, attention_mask=None if attn_mask is None else attn_mask.transpose(1, 2), recycle_q=recycle_q)
 
-import dataclasses
 import math
 from typing import Any
 import torch
@@ -39,59 +38,28 @@ import torch.nn.functional as F
 logger = logging.get_logger(__name__)
 _IMG_TOKENS_PER_SLOT = 4
 _FLEX_BLOCK_SIZE = 128
-@dataclasses.dataclass
-class QwenImage21KVLayerCache:  # a dataclass: CUDA graphs take its tensors as arguments
-    k: torch.Tensor | None = None
-    v: torch.Tensor | None = None
+QwenImage21KVLayerCache = attention_kit.PrefixLayer  # a dataclass: CUDA graphs take its tensors as arguments
 
-    def store(self, k: torch.Tensor, v: torch.Tensor):
-        self.k = k
-        self.v = v
 
-    def get(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.k is None:
-            raise RuntimeError('KV cache has not been populated yet.')
-        return (self.k, self.v)
+class QwenImage21KVCache(attention_kit.PrefixCache):
+    """The prefix cache of the text and condition-image tokens (attention_kit.PrefixCache: INT8 with quantize, in RAM with ram, in VRAM as
+    far as it fits beside the weights with dynamic) and the layout of the cached steps. native=False when the cached prefixes are read in
+    16 bits (NAG)."""
 
-class QwenImage21KVCache:
-
-    def __init__(self, num_layers: int):
-        self.layer_caches = [QwenImage21KVLayerCache() for _ in range(num_layers)]
+    def __init__(self, blocks, quantize: bool=False, native: bool=True, ram: bool=False, dynamic: bool=False):
+        super().__init__(blocks, quantize, native, ram, "Qwen Image 2.1 KV cache", dynamic)
         self.layout = None
+
+    @property
+    def layer_caches(self):
+        return self.layers
 
     def get_layer(self, layer_idx: int) -> QwenImage21KVLayerCache:
-        return self.layer_caches[layer_idx]
+        return self.layers[layer_idx]
 
-    def clear(self):
+    def clear(self, keep_ring: bool=False):
         self.layout = None
-        for layer in self.layer_caches:
-            layer.k = layer.v = None
-
-def apply_rotary_emb_qwen(x: torch.Tensor, freqs_cis: torch.Tensor | tuple[torch.Tensor], use_real: bool=True, use_real_unbind_dim: int=-1) -> tuple[torch.Tensor, torch.Tensor]:
-    if use_real:
-        cos, sin = freqs_cis
-        cos = cos[None, None]
-        sin = sin[None, None]
-        cos, sin = (cos.to(x.device), sin.to(x.device))
-        if use_real_unbind_dim == -1:
-            x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)
-            x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
-        elif use_real_unbind_dim == -2:
-            x_real, x_imag = x.reshape(*x.shape[:-1], 2, -1).unbind(-2)
-            x_rotated = torch.cat([-x_imag, x_real], dim=-1)
-        else:
-            raise ValueError(f'`use_real_unbind_dim={use_real_unbind_dim}` but should be -1 or -2.')
-        out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
-        return out
-    else:
-        # Preserve FP32 complex arithmetic, but bound its disposable scratch.
-        for start in range(0, x.shape[1], 1024):
-            part = x[:, start:start + 1024]
-            rotated = torch.view_as_complex(part.float().reshape(*part.shape[:-1], -1, 2))
-            rotated.mul_(freqs_cis[start:start + 1024].unsqueeze(1))
-            part.copy_(torch.view_as_real(rotated).flatten(3))
-            del part, rotated
-        return x
+        super().clear(keep_ring)
 
 class QwenImage21TemporalTimesteps(nn.Module):
 
@@ -157,10 +125,11 @@ class QwenImage21SwiGLUFeedForward(nn.Module):
         self.gate_layer = nn.Linear(hidden_size, mlp_hidden_size, bias=False)
         self.activation_fn = nn.SiLU()
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor | None=None, segments=None) -> torch.Tensor:
+        """In place of the disposable normalized activation, or added to residual with the gates of segments."""
         check_abort()
         x_list = hidden_states if isinstance(hidden_states, list) else [hidden_states]
-        return kernels.mlp(x_list, self.gate_layer, self.out, "swiglu", up=self.proj)  # in place of the disposable normalized activation
+        return kernels.mlp(x_list, self.gate_layer, self.out, "swiglu", up=self.proj, residual=residual, segments=segments)
 
 class QwenImage21AdaLayerNormContinuous(nn.Module):
 
@@ -195,6 +164,13 @@ def _add_gated_residual_(hidden_states, output, gate, target_start):
         kernels.gated_residual_(hidden_states[:, :target_start], [output[:, :target_start]], gate[-1:].unsqueeze(1), tanh=True)
         kernels.gated_residual_(hidden_states[:, target_start:], [output[:, target_start:]], gate[:-1].unsqueeze(1), tanh=True)
 
+def _gate_segments(gate, batch, tokens, target_start):
+    """kernels.mlp segments of the tanh gates (batch + 1 rows with a prefix, the last one for it) over the flattened tokens."""
+    gate = gate.tanh()
+    if target_start is None:
+        return kernels.gate_segments(gate.unsqueeze(1), batch, tokens)
+    return [(b * tokens + start, b * tokens + stop, row) for b in range(batch) for start, stop, row in ((0, target_start, gate[-1]), (target_start, tokens, gate[b]))]
+
 def _select_modulation_rows(params: torch.Tensor, target_token_mask: torch.Tensor | None) -> torch.Tensor:
     if target_token_mask is None:
         return params.unsqueeze(1)
@@ -220,16 +196,8 @@ def _qwenimage21_prepare_qkv(attn: 'QwenImage21Attention', hidden_states: torch.
     query = query.unflatten(-1, (attn.heads, -1))
     key = key.unflatten(-1, (attn.heads, -1))
     value = value.unflatten(-1, (attn.heads, -1))
-    # Native RMSNorm arithmetic, bounded scratch, disposable Q/K storage.
-    for tensor, norm in ((query, attn.norm_q), (key, attn.norm_k)):
-        for start in range(0, tensor.shape[1], 1024):
-            part = tensor[:, start:start + 1024]
-            part.copy_(norm(part).to(value.dtype))
-            del part
-    del tensor, norm
-    if rotary_emb is not None:
-        query = apply_rotary_emb_qwen(query, rotary_emb, use_real=False)
-        key = apply_rotary_emb_qwen(key, rotary_emb, use_real=False)
+    # Native RMSNorm arithmetic, FP32 complex RoPE, bounded scratch, disposable Q/K storage.
+    _qwenimage21_norm_rope_(query, key, attn, rotary_emb)
     if layer_cache is not None:
         if kv_cache_mode == 'extract' and cache_write_slice is not None:
             layer_cache.store(key[:, cache_write_slice].clone(), value[:, cache_write_slice].clone())
@@ -269,33 +237,43 @@ def _qwenimage21_norm_rope_rows(x, norm, freqs_cis):
     return kernels.complex_norm_rope(x_list, norm, freqs_cis)
 
 
+def _qwenimage21_norm_rope_quant(query, key, attn, rotary_emb, core, settings):
+    """attention_kit fused_quant: the staged Sage 2 quantization of q and/or k with norm_q / norm_k and the complex RoPE, the frequencies
+    (tokens, pairs) viewed as a (1, tokens, 1, pairs, 2) cos / sin table of interleaved pairs. The norm is rounded once (diffusers'
+    RMSNorm rounds the normalized rows, then their product with the weight), the rotation runs in FP32 as complex_norm_rope."""
+    rope = None if rotary_emb is None else torch.view_as_real(rotary_emb)[None, :, None]
+    return kernels.split_half_norm_rope_quant_(query, key, rope, attn.norm_q, attn.norm_k, core, settings, interleaved=True)
+
+
 def _qwenimage21_kit_attention(attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode, segments):
     """QwenImage21AttnProcessor without mask nor NAG: the prefix tokens (text and condition images) attended by segments as before,
     then the target tokens, whose attention to all the keys goes through attention_kit with the prefix keys and values first."""
     x = hidden_states.pop() if isinstance(hidden_states, list) else hidden_states
     outputs, kv_prefix = [], None
     if kv_cache_mode == 'cached':
-        kv_prefix = layer_cache.get()
+        kv_prefix = layer_cache.kv_prefix()
     else:
         prefix_len = segments[-1][1] if segments else 0
         if prefix_len:
             query, key, value, _ = _qwenimage21_prepare_qkv(attn, x[:, :prefix_len], None if rotary_emb is None else rotary_emb[:prefix_len], None, None, None)
             outputs = _qwenimage21_prefix_attention(query, key, value, segments, None)
-            if kv_cache_mode == 'extract':
-                layer_cache.store(key, value)
-            kv_prefix = (key, value)
+            if kv_cache_mode == 'extract':  # the target tokens of this step attend the cached prefix as the next steps will
+                layer_cache.store(key, value, kit=True)
+                kv_prefix = layer_cache.kv_prefix()
+            else:
+                kv_prefix = (key, value)
             del query, key, value
             rotary_emb = None if rotary_emb is None else rotary_emb[prefix_len:]
         x = x[:, prefix_len:].contiguous()
     x_list = [x]
     del x
-    out = attention_kit.qkv_attention(x_list, attn.to_q, attn.to_k, attn.to_v, attn.heads, attn.inner_dim // attn.heads,
-                                      lambda query, key, group: _qwenimage21_norm_rope_(query, key, attn, rotary_emb), kv_prefix=kv_prefix)
+    if x_list[0].shape[1]:  # the target tokens (none in NAG's negative branch: the prefix alone)
+        outputs.append(attention_kit.qkv_attention(x_list, attn.to_q, attn.to_k, attn.to_v, attn.heads, attn.inner_dim // attn.heads,
+                                                   lambda query, key, group: _qwenimage21_norm_rope_(query, key, attn, rotary_emb), kv_prefix=kv_prefix,
+                                                   fused_quant=lambda query, key, group, core, settings: _qwenimage21_norm_rope_quant(query, key, attn, rotary_emb, core, settings)))
     kv_prefix = None
-    if outputs:
-        outputs.append(out)
-        out = torch.cat(outputs, dim=1)
-        outputs.clear()
+    out = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=1)
+    outputs.clear()
     return attn.to_out[1](attn.to_out[0](out.flatten(2, 3)))
 
 
@@ -390,8 +368,7 @@ class QwenImage21TransformerBlock(nn.Module):
         img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), mod2, target_start)
         hidden_holder = [img_modulated2]
         del img_modulated2
-        mlp_output = self.img_mlp(hidden_holder)
-        _add_gated_residual_(hidden_states, mlp_output, img_gate2, target_start)
+        self.img_mlp(hidden_holder, hidden_states, _gate_segments(img_gate2, *hidden_states.shape[:2], target_start))
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
         return hidden_states
@@ -469,7 +446,7 @@ class QwenImage21Transformer2DModel(ModelMixin, ConfigMixin):
         self.gradient_checkpointing = False
 
     @staticmethod
-    def build_token_metadata(image_pad_mask: torch.Tensor, img_shapes: list[tuple[int, int, int]]) -> tuple[torch.Tensor, torch.Tensor]:
+    def build_token_metadata(image_pad_mask: torch.Tensor, img_shapes: list[tuple[int, int, int]], num_target_images: int=1) -> tuple[torch.Tensor, torch.Tensor]:
         image_positions = image_pad_mask.nonzero(as_tuple=True)[0]
         block_lengths = [math.prod(shape) for shape in img_shapes]
         if sum(block_lengths) != image_positions.numel():
@@ -478,10 +455,11 @@ class QwenImage21Transformer2DModel(ModelMixin, ConfigMixin):
         block_ids = torch.repeat_interleave(torch.arange(len(block_lengths), device=image_pad_mask.device), torch.tensor(block_lengths, device=image_pad_mask.device))
         image_ids[image_positions] = block_ids
         target_token_mask = torch.zeros_like(image_pad_mask)
-        target_token_mask[image_positions[-block_lengths[-1]:]] = True
+        # the last num_target_images blocks are the denoised target (several maps attend jointly, each with its own RoPE block)
+        target_token_mask[image_positions[-sum(block_lengths[-num_target_images:]):]] = True
         return (image_ids, target_token_mask)
 
-    def _prepare(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, timestep: torch.Tensor, img_shapes: list[list[tuple[int, int, int]]], img_mask: torch.Tensor, encoder_hidden_states_mask: torch.Tensor | None=None, attention_kwargs: dict[str, Any] | None=None, kv_cache: QwenImage21KVCache | None=None, kv_cache_mode: str | None=None, return_dict: bool=True, target_rope_offset: tuple[int, int]=(0, 0)) -> torch.Tensor | Transformer2DModelOutput:
+    def _prepare(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, timestep: torch.Tensor, img_shapes: list[list[tuple[int, int, int]]], img_mask: torch.Tensor, encoder_hidden_states_mask: torch.Tensor | None=None, attention_kwargs: dict[str, Any] | None=None, kv_cache: QwenImage21KVCache | None=None, kv_cache_mode: str | None=None, return_dict: bool=True, target_rope_offset: tuple[int, int]=(0, 0), num_target_images: int=1) -> torch.Tensor | Transformer2DModelOutput:
         if kv_cache_mode == 'cached':
             rotary_emb, attention_mask, target_tokens = kv_cache.layout
             hidden_states = self.img_in(hidden_states[:, -target_tokens:])
@@ -498,12 +476,12 @@ class QwenImage21Transformer2DModel(ModelMixin, ConfigMixin):
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
         repeats = torch.where(img_mask, _IMG_TOKENS_PER_SLOT, 1)[0]
         image_pad_mask = torch.repeat_interleave(img_mask[0], repeats)
-        target_tokens = math.prod(img_shapes[0][-1])
+        target_tokens = sum(math.prod(shape) for shape in img_shapes[0][-num_target_images:])
         joint_hidden_states = torch.cat([encoder_hidden_states, encoder_hidden_states.new_zeros(batch_size, target_tokens // 4, encoder_hidden_states.shape[2])], dim=1)
         joint_hidden_states = joint_hidden_states.repeat_interleave(repeats, dim=1)
         joint_hidden_states[:, image_pad_mask] = hidden_states
         rotary_emb = self.pos_embed(img_shapes[0], image_pad_mask, device=hidden_states.device, target_offset=target_rope_offset)
-        image_ids, target_token_mask = self.build_token_metadata(image_pad_mask, img_shapes[0])
+        image_ids, target_token_mask = self.build_token_metadata(image_pad_mask, img_shapes[0], num_target_images)
         timestep = timestep.to(hidden_states.dtype)
         if self.config.causal_condition:
             timestep = torch.cat([timestep, timestep.new_zeros(1)], dim=0)
@@ -547,7 +525,7 @@ class QwenImage21Transformer2DModel(ModelMixin, ConfigMixin):
                 temporary_negative_cache = True
                 negative_cache = QwenImage21KVCache(len(self.transformer_blocks))
                 negative = {**negative, 'kv_cache': negative_cache, 'kv_cache_mode': 'extract'}
-            if negative_cache.layer_caches[0].k is None:
+            if negative_cache.layer_caches[0].empty():
                 negative_state, _ = self._prepare(**negative)
                 prefix = negative_state['cache_write_slice'].stop
                 for key in ('hidden_states',):
@@ -577,8 +555,7 @@ class QwenImage21Transformer2DModel(ModelMixin, ConfigMixin):
                     state['hidden_states'] = block(**block_args)
                     del block_args
                 if temporary_negative_cache:
-                    negative_cache.get_layer(index).k = None
-                    negative_cache.get_layer(index).v = None
+                    negative_cache.get_layer(index).clear()
         outputs = []
         for state, temb in prepared:
             # Drop state ownership before the disposable normalization call.

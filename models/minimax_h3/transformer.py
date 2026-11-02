@@ -23,12 +23,14 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from shared import attention_kit
 from shared.attention import pay_attention
 
 from .interrupt import GenerationInterrupted
 from shared.kernels import ops as kernels
+from shared.utils.lora_mapping import convert_lora_keys
 from .pdd import MiniMaxH3ParallelHead
 from .sol_attention import MiniMaxH3SolAttention
 from mmgp import cuda_graphs
@@ -197,6 +199,9 @@ class Attention(nn.Module):
 
     def _out_projection(self, attention_list, seq_len, residual, gate, segments):
         output = _take(attention_list).reshape(seq_len, -1)
+        if residual is not None and gate is None:
+            output_list, output = [output], None
+            return kernels.linear_residual_(self.out_proj, output_list, residual)
         if residual is not None:
             output_list, output = [output], None
             return kernels.gated_linear(self.out_proj, output_list, residual, gate, segments)
@@ -219,6 +224,8 @@ class Attention(nn.Module):
             # VSA: q, k, v and the gate are projected by head groups from one prepared input, so the tiled copies stay bounded
             attention = attention_kit.qkv_attention(x_list, self.q_proj, self.k_proj, self.v_proj, self.heads, self.head_dim,
                                                     lambda query, key, group: self._norm_rope_(query, key, rope, packed_rope, allow_fusion),
+                                                    fused_quant=(lambda query, key, group, core, settings:
+                                                                 kernels.split_half_norm_rope_quant_(query, key, rope, self.q_norm, self.k_norm, core, settings)) if allow_fusion else None,
                                                     attention_fn=self.vsa if use_vsa else self.veda if use_veda else None,
                                                     extra_proj=self.gate_proj if use_vsa else None, head_split_level=VSA_HEAD_SPLIT_LEVEL if use_vsa else None)
             attention_list, attention = [attention], None
@@ -288,14 +295,8 @@ class RefinerBlock(nn.Module):
 
     def forward(self, x_list):
         hidden = _take(x_list)
-        branch = self.attn([self.norm1(hidden)])
-        branch.add_(hidden)
-        del hidden
-        residual = branch
-        branch = self.mlp([self.norm2(residual)])
-        branch.add_(residual)
-        del residual
-        return branch
+        hidden = self.attn([self.norm1(hidden)], residual=hidden)
+        return kernels.mlp([self.norm2(hidden)], self.mlp.fc1, self.mlp.fc2, "swiglu", residual=hidden)
 
 
 class TokenRefiner(nn.Module):
@@ -343,8 +344,7 @@ def _gated_residual(hidden_list, gate_list, branch_list, segments):
     gate, branch = gate_list[0].to(hidden.dtype), _take(branch_list)
     gate_list.clear()
     for start, stop, row in segments:
-        branch[start:stop].mul_(gate[row]).add_(hidden[start:stop])
-        hidden[start:stop].copy_(branch[start:stop])
+        kernels.gated_residual_(hidden[start:stop], [branch[start:stop]], gate[row])
     return hidden
 
 
@@ -360,20 +360,15 @@ class DiTBlock(nn.Module):
                                     dtype=adaln_dtype or dtype, device=device)
 
     @staticmethod
-    def _gated_branch(hidden, gate, branch, segments, signature_stride=0, signature=None):
+    def _gated_branch(hidden, gate, branch, segments, signature_stride, signature=None):
         for start, stop, row in segments:
-            branch[start:stop].mul_(gate[row])
-        if signature_stride:
-            # Sample the existing gated branch before it is released; never materialize a full block residual copy.
-            sampled = branch.reshape(-1)[::signature_stride]
-            if signature is None:
-                signature = sampled.clone()
-            else:
-                signature.add_(sampled)
-            hidden.add_(branch)
+            kernels.gated_residual_(hidden[start:stop], [branch[start:stop]], gate[row])
+        # Sample the gated branch (gated in place) before it is released; never materialize a full block residual copy.
+        sampled = branch.reshape(-1)[::signature_stride]
+        if signature is None:
+            signature = sampled.clone()
         else:
-            branch.add_(hidden)
-            hidden.copy_(branch)
+            signature.add_(sampled)
         return hidden, signature
 
     def forward(self, x_list, temb, segments, rope, residual_signature_elements=0):
@@ -464,13 +459,8 @@ class FinalLayer(nn.Module):
             self.audio_out = MiniMaxH3ParallelHead(hidden, audio_dim, pdd_num_steps, device=device)
 
     def _head(self, h_list, shift, scale, row, output):
-        value = self.norm(_take(h_list)).to(scale.dtype)
-        if isinstance(row, list):
-            for start, stop, index in row:
-                value[start:stop].mul_(1.0 + scale[index]).add_(shift[index])
-        else:
-            value.mul_(1.0 + scale[row]).add_(shift[row])
-        value = value.to(output.weight.dtype)
+        rows = row if isinstance(row, list) else [(0, h_list[0].shape[0], row)]
+        value = kernels.norm_modulate(h_list, self.norm, shift, scale, rows, dtype=scale.dtype).to(torch.float32)
         return output(value)
 
     def forward(self, x_list, temb, video_segment, audio_segment):
@@ -512,6 +502,24 @@ def _prepared_references(refs):
 
 class MiniMaxH3Model(nn.Module):
     def preprocess_loras(self, model_type, state_dict):
+        from .lora_tables import pop_source_tag
+
+        source_package = pop_source_tag(state_dict)
+        attention = self.blocks[0].attn
+        split_map = get_linear_split_map(self.attention_inner_size, attention.heads, attention.head_dim)
+        modules = dict(self.named_modules())
+        state_dict = convert_lora_keys(state_dict, modules,
+                                      fused_split_map=split_map, split_linear_modules_map=split_map)
+        state_dict = {key.removeprefix("diffusion_model."): value for key, value in state_dict.items()}
+        # ComfyUI bundles per-layer backend preferences as uint8 JSON tensors.
+        # Keep WanGP's attention selection and leave other unknown keys for MMGP to reject.
+        config_suffix = ".comfy_attention.config"
+        ignored_configs = [key for key in state_dict if key.endswith(config_suffix)
+                           and isinstance(modules.get(key[:-len(config_suffix)]), Attention)]
+        for key in ignored_configs:
+            state_dict.pop(key)
+        if ignored_configs:
+            tqdm.write(f"MiniMax H3 LoRA: ignored {len(ignored_configs)} ComfyUI attention configurations; using WanGP's selected attention backend.")
         diffusers_format = any(key.startswith(("transformer_blocks.", "token_refiner.refiner_blocks.",
                                                "time_embedder.linear_", "audio_proj_in.", "proj_in.",
                                                "context_embedder.", "norm_out.", "audio_proj_out.", "proj_out."))
@@ -551,6 +559,12 @@ class MiniMaxH3Model(nn.Module):
                                                     ".lora.up.weight", ".lora.up.default.weight")):
                     value = torch.cat(value.chunk(2, dim=0)[::-1], dim=0).contiguous()
             converted[key] = value
+        if self.pdd_num_steps:  # PDD: a base-model head LoRA applies to every head through the base projection
+            for wrapper in ("", "diffusion_model.", "transformer."):
+                for head in ("final_layer.video_out.", "final_layer.audio_out."):
+                    prefix = wrapper + head
+                    for key in [key for key in converted if key.startswith(prefix) and not key.startswith(prefix + "linear.")]:
+                        converted[prefix + "linear." + key[len(prefix):]] = converted.pop(key)
         from .lora_affine import convert_adaln_loras
 
         if self.use_adaln_curves:
@@ -558,17 +572,19 @@ class MiniMaxH3Model(nn.Module):
             for key in ignored:
                 converted.pop(key)
             if ignored:
-                print("MiniMax H3 LoRA: ignored unsupported pruned timestep tensors: " + ", ".join(ignored))
+                tqdm.write("MiniMax H3 LoRA: ignored unsupported pruned timestep tensors: " + ", ".join(ignored))
 
         start = time.perf_counter()
         count, architecture, source_width, target_width = convert_adaln_loras(
             model_type, converted, self.adaln_t_table if self.use_adaln_curves else None,
-            self.hybrid_ref2va_blocks, self.ref2va_adaln_t_table if self.hybrid_ref2va_blocks is not None else None)
+            self.hybrid_ref2va_blocks, self.ref2va_adaln_t_table if self.hybrid_ref2va_blocks is not None else None,
+            source_package=source_package, target_package=self.h3_lora_affine_package, checkpoint_checked=self.h3_lora_map_checked)
         if count:
-            source = f"full AdaLN width {source_width}" if source_width == 2688 else f"{architecture.upper()} pruned AdaLN width {source_width}"
-            target_architecture = "hybrid FL2VA/REF2VA" if self.hybrid_ref2va_blocks is not None else architecture.upper()
+            source_architecture = source_package.name if source_package is not None else architecture.upper()
+            source = f"full AdaLN width {source_width}" if source_width == 2688 else f"{source_architecture} pruned AdaLN width {source_width}"
+            target_architecture = "hybrid FL2VA/REF2VA" if self.hybrid_ref2va_blocks is not None else (self.h3_lora_affine_package.name if self.h3_lora_affine_package is not None else architecture.upper())
             target = f"full AdaLN width {target_width}" if target_width == 2688 else f"{target_architecture} pruned AdaLN width {target_width}"
-            print(f"MiniMax H3 LoRA: converted {count} AdaLN adapters from {source} to {target} in {time.perf_counter() - start:.2f}s")
+            tqdm.write(f"MiniMax H3 LoRA: converted {count} AdaLN adapters from {source} to {target} in {time.perf_counter() - start:.2f}s")
         if hasattr(self.blocks[0].attn, "q_proj"):
             return converted
         for down_suffix, up_suffix in (("lora_A.weight", "lora_B.weight"), ("lora_down.weight", "lora_up.weight"),
@@ -587,7 +603,11 @@ class MiniMaxH3Model(nn.Module):
                     alpha = converted.pop(prefix + projection + ".alpha", None)
                     scales.append(1.0 if alpha is None else float(alpha) / down[-1].shape[0])
                 converted[prefix + "qkv_proj." + down_suffix] = torch.cat(down)
-                converted[prefix + "qkv_proj." + up_suffix] = torch.block_diag(*(weight * scale for weight, scale in zip(up, scales)))
+                up = torch.block_diag(*(weight * scale for weight, scale in zip(up, scales)))
+                attention = self.get_submodule(prefix.rstrip("."))
+                if attention.qkv_interleaved:
+                    up = up.reshape(3, attention.heads, attention.head_dim, -1).permute(1, 0, 2, 3).reshape(3 * self.attention_inner_size, -1).contiguous()
+                converted[prefix + "qkv_proj." + up_suffix] = up
         return converted
 
     def __init__(self, hidden_size=5376, num_layers=50, token_refiner_num_layers=2,
@@ -609,6 +629,8 @@ class MiniMaxH3Model(nn.Module):
         self.latents_dim = latents_dim
         self.audio_latents_dim = audio_latents_dim
         self.use_adaln_curves = adaln_curve_grid is not None
+        self.h3_lora_affine_package = None
+        self.h3_lora_map_checked = False
         self.hybrid_ref2va_blocks = hybrid_ref2va_blocks
         self.pdd_num_steps = pdd_num_steps
         self.pdd_block_size = pdd_block_size
@@ -653,7 +675,8 @@ class MiniMaxH3Model(nn.Module):
         else:
             fp32_modules.extend((self.time_embedder.proj_in, self.time_embedder.proj_out))
         for module in fp32_modules:
-            module._lock_dtype = torch.float32
+            for submodule in module.modules():
+                submodule._lock_dtype = torch.float32
 
     def preprocess_text_embeds(self, text_states):
         if text_states.shape[-1] == self.hidden_size:
@@ -721,7 +744,7 @@ class MiniMaxH3Model(nn.Module):
         # Skips are applied in row chunks so no full-sequence skip tensor is ever materialized.
         for first, last in row_ranges:
             for start, stop in _chunk_rows(first, last):
-                hidden[start:stop].add_(after_proj(stream[start:stop]), alpha=scale)
+                kernels.linear_residual_(after_proj, [stream[start:stop]], hidden[start:stop], scale)
 
     def _time_embedding(self, timesteps, table=None):
         if not self.use_adaln_curves:
