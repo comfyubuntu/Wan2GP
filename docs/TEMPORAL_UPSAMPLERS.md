@@ -35,6 +35,7 @@ class MyTemporalUpsampler:
     def download(self, process_files, send_cmd=None, status_text=None, temporal_upsampling=None): ...
     def query_download_def(self, *, enabled_only=True): ...    # -> one process_files definition
     def query_download_defs(self, *, enabled_only=True): ...   # -> list of process_files definitions
+    def query_checkpoint_inventory(self): ...                  # all checkpoint variants, independent of the selected settings; see PLUGINS.md
     def load_upsampler(self, value, **kwargs): ...             # optional pre-dispatch load hook
     def supports_loaded_model(self, value, context): ...       # optional core-model borrowing
     def release_private_runtime(self): ...                     # optional before borrowing core model
@@ -117,6 +118,30 @@ the next chunk can continue smoothly.
 Do not assume a different frame layout than the one passed by WanGP. Convert
 dtypes or layouts only when the handler implementation requires it, and keep the
 returned sample layout compatible with the surrounding WanGP postprocessing flow.
+
+### Long videos
+
+A long video is interpolated a chunk at a time, so that it never has to fit in
+memory. A handler declares how through `query_chunking(value)`, with the fields
+described in
+[Spatial Upsampler Plugin API](SPATIAL_UPSAMPLERS.md#long-videos-chunk-rules).
+A frame interpolator typically shares one frame between chunks and keeps every
+output frame but the last one, which opens the next chunk:
+
+```python
+class MyChunkRules:
+    overlap_frames = 1
+    minimum_requested_frames = 2
+
+    def get_overlap_frames(self, chunk_frames):
+        return min(self.overlap_frames, chunk_frames - 1)
+
+    def output_write_range(self, returned_frames, *, source_write_start, source_write_end, next_overlap_frames):
+        return source_write_start, returned_frames - next_overlap_frames
+```
+
+Each chunk is one `temporal_upsample(...)` call without `previous_last_frame`.
+A handler without `query_chunking` receives its video in one piece.
 
 `postprocessing/temporal_upsamplers.py` wraps dispatch in shared attention state,
 unloads the main generation offload object before running the temporal upsampler,
